@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-
-	_ "net/http/pprof"
 )
 
 type channelInput struct {
@@ -81,36 +79,55 @@ func createJobs(jobs chan channelInput, hashes map[string]string) {
 	}
 }
 
-func updateResult(done chan channelOutput, i, l int) {
+func updateResult(done chan channelOutput, i, l int, folder string) {
 	mergers.Add(1)
 	defer mergers.Done()
-	fmt.Printf("{\n")
 	for img := range done {
-		log.Printf("(%.2f %%)[%d/%d]processing %s", float64(float64(i)*100.0/float64(l)), i, l, img.key)
+		log.Printf(
+			"(%.2f %%) [%d/%d] processing %s -> %d matches",
+			float64(float64(i)*100.0/float64(l)),
+			i,
+			l,
+			img.key,
+			len(img.result),
+		)
 		i++
-		result[img.key] = img.result
-		jsonResult, _ := json.MarshalIndent(img.result, "", "    ")
-		fmt.Printf(",\n    \"%s\": %s", img.key, jsonResult)
+		jsonResult, err := json.MarshalIndent(img.result, "", "    ")
+		if err != nil {
+			log.Printf("error creating json string: '%+v'", err)
+			continue
+		}
+		file, err := os.Create(folder + img.key)
+		if err != nil {
+			log.Printf("error creating file: '%+v'", err)
+			continue
+		}
+		if wrote, err := file.Write(jsonResult); err != nil {
+			log.Printf("error writing to file, %d bytes writed, error :'%+v'", wrote, err)
+			continue
+		}
+		file.Close()
 	}
-	fmt.Printf("\n}")
 }
 
-var result = map[string]map[string]int{}
+func removeSufix(value string) string {
+	return strings.Replace(value, ".jpg", "", -1)
+}
+
 var workers sync.WaitGroup
 var mergers sync.WaitGroup
 var jobCreators sync.WaitGroup
 
 func main() {
+	inputFile := flag.String("input", "", "input file in json format")
+	outputFolder := flag.String("output", "", "output folder for the resulting files")
 	flag.Parse()
-	args := flag.Args()
-	if len(args) != 1 {
+	if *inputFile == "" || *outputFolder == "" {
 		log.Printf("you must specify one json file containing key->hash to process.")
 		return
 	}
-	go func() { log.Fatal(http.ListenAndServe(":4000", nil)) }()
 
-	file := args[0]
-	jsonFile, err := os.Open(file)
+	jsonFile, err := os.Open(*inputFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -124,18 +141,27 @@ func main() {
 	if err := json.Unmarshal(byteValue, &hashes); err != nil {
 		log.Fatal(err)
 	}
+
 	for key, value := range hashes {
 		hashes[key] = hexToBin(value)
 	}
 
+	newHashes := map[string]string{}
+	for key, value := range hashes {
+		newKey := removeSufix(key)
+		newHashes[newKey] = value
+		delete(hashes, key)
+	}
+	hashes = newHashes
+
 	nWorker := 4
-	jobs := make(chan channelInput, nWorker)
-	done := make(chan channelOutput, nWorker)
+	jobs := make(chan channelInput, nWorker+1)
+	done := make(chan channelOutput, nWorker+1)
 
 	i := 1
 	l := len(hashes)
 	go createJobs(jobs, hashes)
-	go updateResult(done, i, l)
+	go updateResult(done, i, l, *outputFolder)
 	for n := 1; n <= nWorker; n++ {
 		log.Printf("starting worker %d", n)
 		go getSimilarityComparison(jobs, done)
